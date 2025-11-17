@@ -32,9 +32,6 @@ class SearchMediaTool(MoviePilotTool):
         logger.info(
             f"执行工具: {self.name}, 参数: title={title}, year={year}, media_type={media_type}, season={season}")
 
-        # 发送工具执行说明
-        await self.send_tool_message(f"正在搜索媒体资源: {title}" + (f" ({year})" if year else ""), title="搜索中")
-
         try:
             media_chain = MediaChain()
             # 构建搜索标题
@@ -47,7 +44,7 @@ class SearchMediaTool(MoviePilotTool):
                 search_title = f"{search_title} S{season:02d}"
 
             # 使用 MediaChain.search 方法
-            meta, results = media_chain.search(title=search_title)
+            meta, results = await media_chain.async_search(title=search_title)
 
             # 过滤结果
             if results:
@@ -63,7 +60,32 @@ class SearchMediaTool(MoviePilotTool):
                     filtered_results.append(result)
 
                 if filtered_results:
-                    return json.dumps([r.to_dict() for r in filtered_results], ensure_ascii=False, indent=2)
+                    # 限制最多20条结果
+                    total_count = len(filtered_results)
+                    limited_results = filtered_results[:20]
+                    # 精简字段，只保留关键信息
+                    simplified_results = []
+                    for r in limited_results:
+                        simplified = {
+                            "title": r.title,
+                            "en_title": r.en_title,
+                            "year": r.year,
+                            "type": r.type.value if r.type else None,
+                            "season": r.season,
+                            "tmdb_id": r.tmdb_id,
+                            "imdb_id": r.imdb_id,
+                            "douban_id": r.douban_id,
+                            "overview": r.overview[:200] + "..." if r.overview and len(r.overview) > 200 else r.overview,
+                            "vote_average": r.vote_average,
+                            "poster_path": r.poster_path,
+                            "detail_link": r.detail_link
+                        }
+                        simplified_results.append(simplified)
+                    result_json = json.dumps(simplified_results, ensure_ascii=False, indent=2)
+                    # 如果结果被裁剪，添加提示信息
+                    if total_count > 20:
+                        return f"注意：搜索结果共找到 {total_count} 条，为节省上下文空间，仅显示前 20 条结果。\n\n{result_json}"
+                    return result_json
                 else:
                     return f"未找到符合条件的媒体资源: {title}"
             else:
