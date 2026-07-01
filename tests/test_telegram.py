@@ -253,6 +253,15 @@ def test_send_msg_markdown_escaping(telegram):
     assert send_kwargs["text"].startswith("*测试标题*\n")
 
 
+def test_telegramify_new_content_fields_are_used_directly():
+    """新版telegramify对象应直接使用已渲染的MarkdownV2字段"""
+    text_item = SimpleNamespace(content="已转义\\_文本")
+    file_item = SimpleNamespace(caption="已转义\\_说明")
+
+    assert Telegram._telegramify_item_text(text_item) == "已转义\\_文本"
+    assert Telegram._telegramify_item_caption(file_item) == "已转义\\_说明"
+
+
 def test_send_msg_with_html_parse_mode_keeps_html(telegram):
     """HTML模式发送时应保留调用方传入的HTML内容"""
     result = telegram.send_msg(
@@ -345,8 +354,8 @@ def test_edit_msg_with_html_parse_mode_keeps_html(telegram):
     assert edit_kwargs["text"] == "<b>标题</b>\n<blockquote>请选择</blockquote>"
 
 
-def test_edit_msg_keeps_other_edit_errors_failed(telegram):
-    """非图片 caption 场景的编辑错误不应被错误标记为成功。"""
+def test_edit_msg_treats_message_not_modified_as_success(telegram):
+    """重复编辑相同内容时应视为成功，避免记录错误日志。"""
     telegram.bot.edit_message_text.side_effect = Exception(
         "Bad Request: message is not modified"
     )
@@ -358,6 +367,36 @@ def test_edit_msg_keeps_other_edit_errors_failed(telegram):
         text="测试内容",
     )
 
-    assert result is False
+    assert result is True
     telegram.bot.edit_message_text.assert_called_once()
     telegram.bot.edit_message_caption.assert_not_called()
+
+
+def test_send_msg_edit_with_image_falls_back_to_text_when_image_url_unavailable(telegram):
+    """编辑图片消息失败时应去掉图片并降级为文本编辑。"""
+    telegram.bot.edit_message_media.side_effect = Exception(
+        "Bad Request: failed to get HTTP URL content"
+    )
+
+    result = telegram.send_msg(
+        title="测试标题",
+        text="测试内容",
+        image="https://example.com/poster.jpg",
+        buttons=[[{"text": "确认", "callback_data": "confirm"}]],
+        original_chat_id="1051253579",
+        original_message_id=110502,
+    )
+
+    assert result == {
+        "success": True,
+        "message_id": 110502,
+        "chat_id": "1051253579",
+    }
+    telegram.bot.edit_message_media.assert_called_once()
+    telegram.bot.edit_message_text.assert_called_once()
+    edit_kwargs = telegram.bot.edit_message_text.call_args.kwargs
+    assert edit_kwargs["chat_id"] == "1051253579"
+    assert edit_kwargs["message_id"] == 110502
+    assert "测试标题" in edit_kwargs["text"]
+    assert "测试内容" in edit_kwargs["text"]
+    assert edit_kwargs["reply_markup"] is not None

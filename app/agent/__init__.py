@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import re
 import traceback
@@ -148,6 +149,16 @@ class _SessionUsageSnapshot:
         }
 
 
+@dataclass
+class _CompiledAgentBundle:
+    """会话内可复用的 Agent 图及其构造签名。"""
+
+    signature: tuple[Any, ...]
+    agent: Any
+    streaming: bool
+    created_at: datetime
+
+
 class _ThinkTagStripper:
     """
     流式剥离 <think>...</think> 标签的辅助类。
@@ -280,6 +291,8 @@ class MoviePilotAgent:
         self._llm_runtime_config: Optional[Dict[str, Any]] = None
         self._llm_provider_selection: Dict[str, Any] = {}
         self._agent_started_at: Optional[datetime] = None
+        self._compiled_agent_bundle: Optional[_CompiledAgentBundle] = None
+        self._last_agent_cache_hit = False
 
         # 流式token管理
         self.stream_handler = StreamingHandler()
@@ -838,6 +851,8 @@ class MoviePilotAgent:
         detail = cls._exception_detail_text(error).lower()
         if "no endpoints found that support image input" in detail:
             return True
+        if "not a vlm" in detail or "text-only prompts" in detail:
+            return True
         if "unknown variant" in detail and "image_url" in detail:
             return True
         if "image input" not in detail and "images" not in detail:
@@ -978,6 +993,90 @@ class MoviePilotAgent:
             allow_message_tools=self.allow_message_tools,
         )
 
+    def _refresh_tool_context(self, values: Dict[str, object]) -> None:
+        """
+        刷新本轮工具共享上下文。
+
+        工具对象可能随会话内 Agent 图缓存被复用，因此这里保留 dict 对象本身，
+        只替换其中内容，确保缓存工具看到的是最新权限与回复状态。
+        """
+        self._tool_context.clear()
+        self._tool_context.update(values)
+
+    @staticmethod
+    def _public_runtime_config_signature(runtime_config: Dict[str, Any]) -> tuple:
+        """生成不包含密钥明文的 LLM 运行时签名。"""
+        api_key = runtime_config.get("api_key") or ""
+        api_key_digest = (
+            hashlib.sha256(str(api_key).encode("utf-8")).hexdigest()[:12]
+            if api_key
+            else ""
+        )
+        return (
+            runtime_config.get("provider"),
+            runtime_config.get("model"),
+            api_key_digest,
+            runtime_config.get("base_url"),
+            runtime_config.get("base_url_preset"),
+            runtime_config.get("user_agent"),
+            bool(runtime_config.get("use_proxy")),
+            runtime_config.get("thinking_level"),
+        )
+
+    async def _agent_bundle_signature(self, streaming: bool) -> tuple[Any, ...]:
+        """构造会话内 Agent 图缓存签名。"""
+        runtime_config = await self._resolve_llm_runtime_config()
+        return (
+            streaming,
+            self.channel,
+            self.source,
+            self.user_id,
+            self.username,
+            self.allow_message_tools,
+            bool(self._tool_context.get("is_admin")),
+            self.has_message_context,
+            self.is_background,
+            settings.AI_AGENT_VERBOSE,
+            settings.LLM_MAX_TOOLS,
+            settings.LLM_MAX_ITERATIONS,
+            self._public_runtime_config_signature(runtime_config),
+            agent_runtime_manager.current_signature(),
+        )
+
+    def _get_cached_agent(
+            self, signature: tuple[Any, ...], streaming: bool
+    ) -> Optional[Any]:
+        """按签名读取当前会话已编译的 Agent 图。"""
+        bundle = self._compiled_agent_bundle
+        if (
+            bundle
+            and bundle.streaming == streaming
+            and bundle.signature == signature
+        ):
+            return bundle.agent
+        return None
+
+    def _cache_agent(
+        self,
+        *,
+        signature: tuple[Any, ...],
+        agent: Any,
+        streaming: bool,
+    ) -> Any:
+        """保存当前会话可复用的 Agent 图。"""
+        self._compiled_agent_bundle = _CompiledAgentBundle(
+            signature=signature,
+            agent=agent,
+            streaming=streaming,
+            created_at=datetime.now(),
+        )
+        return agent
+
+    @staticmethod
+    def _latest_turn_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
+        """从完整历史中提取本轮新增用户消息。"""
+        return [messages[-1]] if messages else []
+
     def _initialize_subagent_tools(self) -> List:
         """
         初始化子代理专用静默工具列表。
@@ -1004,6 +1103,13 @@ class MoviePilotAgent:
         :param streaming: 是否启用流式输出
         """
         try:
+            bundle_signature = await self._agent_bundle_signature(streaming)
+            cached_agent = self._get_cached_agent(bundle_signature, streaming)
+            self._last_agent_cache_hit = bool(cached_agent)
+            if cached_agent:
+                logger.debug(f"复用会话内 Agent 图: session_id={self.session_id}")
+                return cached_agent
+
             # 系统提示词
             system_prompt = prompt_manager.get_agent_prompt(channel=self.channel)
 
@@ -1023,6 +1129,7 @@ class MoviePilotAgent:
             skills_middleware = SkillsMiddleware(
                 sources=[str(agent_runtime_manager.skills_dir)],
                 bundled_skills_dir=str(settings.ROOT_PATH / "skills"),
+                stream_handler=self.stream_handler,
             )
             skill_tools = list(getattr(skills_middleware, "tools", []) or [])
             activity_log_middleware = None
@@ -1030,6 +1137,7 @@ class MoviePilotAgent:
             if self.has_message_context:
                 activity_log_middleware = ActivityLogMiddleware(
                     activity_dir=str(agent_runtime_manager.activity_dir),
+                    stream_handler=self.stream_handler,
                 )
                 activity_log_tools = list(
                     getattr(activity_log_middleware, "tools", []) or []
@@ -1109,12 +1217,17 @@ class MoviePilotAgent:
                     )
                 )
 
-            return create_agent(
+            agent = create_agent(
                 model=agent_model,
                 tools=[*tools, *skill_tools, *activity_log_tools],
                 system_prompt=system_prompt,
                 middleware=middlewares,
                 checkpointer=InMemorySaver(),
+            )
+            return self._cache_agent(
+                signature=bundle_signature,
+                agent=agent,
+                streaming=streaming,
             )
         except Exception as e:
             logger.error(f"创建 Agent 失败: {e}")
@@ -1133,12 +1246,15 @@ class MoviePilotAgent:
         user_display_saved = False
         try:
             logger.info(
-                f"Agent推理: session_id={self.session_id}, input={message}, "
+                f"Agent推理: session_id={self.session_id}, "
+                f"input_chars={len(message or '')}, "
                 f"images={len(images) if images else 0}, files={len(files) if files else 0}, "
                 f"audio_input={has_audio_input}"
             )
-            self._tool_context = await self._build_tool_context(
-                should_dispatch_reply=self.should_dispatch_reply
+            self._refresh_tool_context(
+                await self._build_tool_context(
+                    should_dispatch_reply=self.should_dispatch_reply
+                )
             )
             self._streamed_output = ""
 
@@ -1326,6 +1442,11 @@ class MoviePilotAgent:
 
             # 创建智能体（根据是否流式传入不同 LLM）
             agent = await self._create_agent(streaming=use_streaming)
+            input_messages = (
+                self._latest_turn_messages(messages)
+                if self._last_agent_cache_hit
+                else messages
+            )
 
             if use_streaming:
                 self.stream_handler.set_dispatch_policy(
@@ -1344,7 +1465,7 @@ class MoviePilotAgent:
                 # 流式运行智能体，token 直接推送到 stream_handler
                 await self._stream_agent_tokens(
                     agent=agent,
-                    messages={"messages": messages},
+                    messages={"messages": input_messages},
                     config=agent_config,
                     on_token=self._handle_stream_text,
                 )
@@ -1383,7 +1504,7 @@ class MoviePilotAgent:
             else:
                 # 非流式模式：后台任务或渠道不支持消息编辑
                 await agent.ainvoke(
-                    {"messages": messages},
+                    {"messages": input_messages},
                     config=agent_config,
                 )
 
@@ -1442,9 +1563,11 @@ class MoviePilotAgent:
 
         except asyncio.CancelledError:
             logger.info(f"Agent执行被取消: session_id={self.session_id}")
+            self._compiled_agent_bundle = None
             execution_error = "任务已取消"
             return "任务已取消", {}
         except Exception as e:
+            self._compiled_agent_bundle = None
             execution_error = str(e)
             if self._messages_have_image_input(messages) and self._is_unsupported_image_input_error(e):
                 logger.warning(
@@ -1481,6 +1604,7 @@ class MoviePilotAgent:
                 original_chat_id=self.original_chat_id,
                 title=title,
                 text=message,
+                save_history=False,
             )
         )
 
@@ -1488,6 +1612,7 @@ class MoviePilotAgent:
         """
         清理智能体资源
         """
+        self._compiled_agent_bundle = None
         logger.info(f"MoviePilot智能体已清理: session_id={self.session_id}")
 
 
@@ -1511,6 +1636,10 @@ class _MessageTask:
     processing_status: Optional[dict] = None
     reply_mode: ReplyMode = ReplyMode.DISPATCH
     allow_message_tools: bool = True
+    output_callback: Optional[Callable[[str], None]] = None
+    notification_callback: Optional[Callable[[Any], None]] = None
+    agent_factory: Optional[Callable[..., MoviePilotAgent]] = None
+    completion_future: Optional[asyncio.Future] = None
 
 
 class AgentManager:
@@ -1615,6 +1744,12 @@ class AgentManager:
         queue = self._session_queues.get(session_id)
         return bool(queue and not queue.empty())
 
+    def is_session_busy(self, session_id: str) -> bool:
+        """
+        查询会话是否仍有正在执行或排队的任务。
+        """
+        return self._is_session_busy(session_id)
+
     def _expired_idle_sessions(self) -> list[tuple[str, str]]:
         """
         收集已经超过空闲时间且当前不忙的会话。
@@ -1656,11 +1791,18 @@ class AgentManager:
             original_chat_id: Optional[str] = None,
             reply_mode: ReplyMode = ReplyMode.DISPATCH,
             allow_message_tools: bool = True,
+            output_callback: Optional[Callable[[str], None]] = None,
+            notification_callback: Optional[Callable[[Any], None]] = None,
+            agent_factory: Optional[Callable[..., MoviePilotAgent]] = None,
+            wait_for_completion: bool = False,
     ) -> str:
         """
         处理用户消息：将消息放入会话队列，按顺序依次处理。
         同一会话的消息排队等待，不同会话之间互不影响。
         """
+        completion_future = (
+            asyncio.get_running_loop().create_future() if wait_for_completion else None
+        )
         task = _MessageTask(
             session_id=session_id,
             user_id=user_id,
@@ -1675,6 +1817,10 @@ class AgentManager:
             original_chat_id=original_chat_id,
             reply_mode=reply_mode,
             allow_message_tools=allow_message_tools,
+            output_callback=output_callback,
+            notification_callback=notification_callback,
+            agent_factory=agent_factory,
+            completion_future=completion_future,
         )
         self._record_session_activity(session_id, user_id)
 
@@ -1707,6 +1853,8 @@ class AgentManager:
                 self._session_worker(session_id)
             )
 
+        if completion_future:
+            return await completion_future
         return ""
 
     async def _session_worker(self, session_id: str):
@@ -1730,9 +1878,17 @@ class AgentManager:
 
                 try:
                     await self._start_task_processing_status(task)
-                    await self._process_message_internal(task)
+                    result = await self._process_message_internal(task)
+                    if task.completion_future and not task.completion_future.done():
+                        task.completion_future.set_result(result)
+                except asyncio.CancelledError as err:
+                    if task.completion_future and not task.completion_future.done():
+                        task.completion_future.set_exception(err)
+                    raise
                 except Exception as e:
                     logger.error(f"处理会话 {session_id} 的消息失败: {e}")
+                    if task.completion_future and not task.completion_future.done():
+                        task.completion_future.set_exception(e)
                 finally:
                     await self._finish_task_processing_status(task)
                     queue.task_done()
@@ -1771,21 +1927,36 @@ class AgentManager:
         实际处理单条消息
         """
         session_id = task.session_id
+        existing_agent = self.active_agents.get(session_id)
+        if (
+                existing_agent
+                and task.agent_factory
+                and isinstance(task.agent_factory, type)
+                and not isinstance(existing_agent, task.agent_factory)
+        ):
+            await existing_agent.cleanup()
+            self.active_agents.pop(session_id, None)
+
         if session_id not in self.active_agents:
             logger.info(
                 f"创建新的AI智能体实例，session_id: {session_id}, user_id: {task.user_id}"
             )
-            agent = MoviePilotAgent(
-                session_id=session_id,
-                user_id=task.user_id,
-                channel=task.channel,
-                source=task.source,
-                username=task.username,
-                original_message_id=task.original_message_id,
-                original_chat_id=task.original_chat_id,
-                replay_mode=task.reply_mode,
-                allow_message_tools=task.allow_message_tools,
-            )
+            agent_factory = task.agent_factory or MoviePilotAgent
+            agent_kwargs = {
+                "session_id": session_id,
+                "user_id": task.user_id,
+                "channel": task.channel,
+                "source": task.source,
+                "username": task.username,
+                "original_message_id": task.original_message_id,
+                "original_chat_id": task.original_chat_id,
+                "replay_mode": task.reply_mode,
+                "allow_message_tools": task.allow_message_tools,
+                "output_callback": task.output_callback,
+            }
+            if task.notification_callback is not None and task.agent_factory:
+                agent_kwargs["notification_callback"] = task.notification_callback
+            agent = agent_factory(**agent_kwargs)
             self.active_agents[session_id] = agent
         else:
             agent = self.active_agents[session_id]
@@ -1800,6 +1971,12 @@ class AgentManager:
             agent.original_chat_id = task.original_chat_id
             agent.reply_mode = task.reply_mode
             agent.allow_message_tools = task.allow_message_tools
+            if hasattr(agent, "set_output_callback"):
+                agent.set_output_callback(task.output_callback)
+            else:
+                agent.output_callback = task.output_callback
+            if task.notification_callback is not None and hasattr(agent, "set_notification_callback"):
+                agent.set_notification_callback(task.notification_callback)
 
         process_kwargs = {
             "images": task.images,

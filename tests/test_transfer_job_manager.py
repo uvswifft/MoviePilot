@@ -265,6 +265,81 @@ class TransferJobManagerTest(unittest.TestCase):
         self.assertEqual(target_item, transferinfo.target_item)
         self.assertEqual(target_folder, transferinfo.target_diritem)
 
+    def test_single_file_transfer_intercept_event_carries_file_meta(self):
+        """
+        单文件整理拦截事件应携带元数据，便于事件处理器按季集匹配。
+        """
+        handler = TransHandler()
+        source_item = FileItem(
+            storage="alist",
+            path="/downloads/Test.Show.S02E03.mkv",
+            type="file",
+            name="Test.Show.S02E03.mkv",
+            basename="Test.Show.S02E03",
+            extension="mkv",
+            size=1024,
+            modify_time=1715939275.0,
+        )
+        target_path = Path("/library")
+        target_file = Path("/library/Test.Show.S02E03.mkv")
+        target_folder = FileItem(
+            storage="alist",
+            type="dir",
+            path="/library/",
+            name="library",
+            basename="library",
+        )
+        target_item = FileItem(
+            storage="alist",
+            path=target_file.as_posix(),
+            type="file",
+            name=target_file.name,
+            basename=target_file.stem,
+            extension="mkv",
+            size=1024,
+        )
+        source_oper = SimpleNamespace(
+            is_support_transtype=lambda transfer_type: True,
+            move=lambda fileitem, path, name: True,
+        )
+        target_oper = SimpleNamespace(
+            get_folder=lambda path: target_folder,
+            get_item=lambda path: None,
+        )
+        in_meta = MetaVideo("Test.Show.S02E03")
+
+        with patch.object(
+                TransHandler, "get_rename_path", return_value=target_file
+        ), patch(
+                "app.modules.filemanager.transhandler.DirectoryHelper.get_media_root_path",
+                return_value=Path("/library"),
+        ), patch.object(
+                TransHandler,
+                "_TransHandler__transfer_command",
+                return_value=(target_item, ""),
+        ), patch(
+                "app.modules.filemanager.transhandler.eventmanager.send_event",
+                return_value=None,
+        ) as send_event:
+            transferinfo = handler.transfer_media(
+                fileitem=source_item,
+                in_meta=in_meta,
+                mediainfo=make_media_info(),
+                target_storage="alist",
+                target_path=target_path,
+                transfer_type="move",
+                source_oper=source_oper,
+                target_oper=target_oper,
+                need_scrape=True,
+                need_notify=True,
+            )
+
+        self.assertTrue(transferinfo.success)
+        event_data = send_event.call_args.args[1]
+        self.assertIs(in_meta, event_data.meta)
+        self.assertEqual(2, event_data.meta.begin_season)
+        self.assertEqual(3, event_data.meta.begin_episode)
+
     def test_success_callback_uses_transfer_result_target_diritem(self):
         """
         回调发送刮削事件时应直接使用整理结果里的目标目录项。
@@ -616,7 +691,7 @@ class TransferJobManagerTest(unittest.TestCase):
         self.assertEqual([("abc123", "qbittorrent")], completed)
         self.assertEqual([], chain.jobview.list_jobs())
 
-    def test_do_transfer_does_not_sync_extra_files_by_default(self):
+    def test_do_transfer_syncs_same_stem_extra_files_by_default(self):
         chain = make_transfer_chain()
         planned = []
         main_fileitem = make_fileitem(
@@ -680,7 +755,13 @@ class TransferJobManagerTest(unittest.TestCase):
 
         self.assertTrue(state)
         self.assertEqual("", errmsg)
-        self.assertEqual([main_fileitem.path], planned)
+        self.assertEqual(
+            [
+                main_fileitem.path,
+                subtitle_fileitem.path,
+            ],
+            planned,
+        )
 
     def test_manual_transfer_enables_sync_extra_files(self):
         chain = make_transfer_chain()
@@ -956,10 +1037,11 @@ class TransferJobManagerTest(unittest.TestCase):
         self.assertEqual(
             [
                 (main_ep1_fileitem.path, 1),
-                (main_ep2_fileitem.path, 2),
                 (ep1_subtitle_fileitem.path, 1),
                 (ep1_audio_fileitem.path, 1),
+                (main_ep2_fileitem.path, 2),
                 (ep2_subtitle_fileitem.path, 2),
+                (other_title_fileitem.path, 1),
             ],
             planned,
         )

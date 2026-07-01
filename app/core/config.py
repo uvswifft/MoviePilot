@@ -170,6 +170,10 @@ class ConfigModel(BaseModel):
     GLOBAL_IMAGE_CACHE_DAYS: int = 7
     # 临时文件保留天数
     TEMP_FILE_DAYS: int = 3
+    # pip/uv 包下载缓存保留天数
+    PACKAGE_CACHE_DAYS: int = 90
+    # pip/uv 包下载缓存根目录，留空时使用配置目录下的 .cache
+    PACKAGE_CACHE_ROOT: Optional[str] = None
     # 元数据识别缓存过期时间（小时），0为自动
     META_CACHE_EXPIRE: int = 0
 
@@ -596,7 +600,7 @@ class ConfigModel(BaseModel):
     # AI推荐条目数量限制
     AI_RECOMMEND_MAX_ITEMS: int = 50
     # LLM工具选择中间件最大工具数量，0为不启用工具选择中间件
-    LLM_MAX_TOOLS: int = 20
+    LLM_MAX_TOOLS: int = 0
     # AI智能体定时任务检查间隔（小时），0为不启用，默认24小时
     AI_AGENT_JOB_INTERVAL: int = 0
     # AI智能体啰嗦模式，开启后会回复工具调用过程
@@ -941,6 +945,12 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
     @property
     def CACHE_PATH(self):
         return self.CONFIG_PATH / "cache"
+
+    @property
+    def PACKAGE_CACHE_PATH(self):
+        if self.PACKAGE_CACHE_ROOT and self.PACKAGE_CACHE_ROOT.strip():
+            return Path(self.PACKAGE_CACHE_ROOT).expanduser()
+        return self.CONFIG_PATH / ".cache"
 
     @property
     def ROOT_PATH(self):

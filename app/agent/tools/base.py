@@ -238,10 +238,6 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
 
         # 获取工具执行提示消息
         tool_message = self.get_tool_message(**kwargs)
-        if not tool_message:
-            explanation = kwargs.get("explanation")
-            if explanation:
-                tool_message = explanation
 
         # 发送工具执行过程消息（流式传输且非最后终结工具时）
         if self._stream_handler and self._stream_handler.is_streaming and not self.return_direct:
@@ -325,16 +321,13 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
         获取工具执行时的友好提示消息。
 
         子类可以重写此方法，根据实际参数生成个性化的提示消息。
-        如果返回 None 或空字符串，将回退使用 explanation 参数。
-
         Args:
-            **kwargs: 工具的所有参数（包括 explanation）
+            **kwargs: 工具的所有参数
 
         Returns:
-            str: 友好的提示消息，如果返回 None 或空字符串则使用 explanation
+            str: 友好的提示消息
         """
-        explanation = kwargs.get("explanation")
-        return str(explanation) if explanation else None
+        return None
 
     @abstractmethod
     async def run(self, **kwargs) -> str:
@@ -431,7 +424,8 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
         :return: 普通用户允许读写的本地目录列表
         """
         roots = [
-            settings.CONFIG_PATH / "agent"
+            settings.CONFIG_PATH / "agent",
+            settings.LOG_PATH,
         ]
         resolved_roots = []
         for root in roots:
@@ -467,7 +461,7 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
         allowed_text = "、".join(str(root) for root in allowed_roots)
         return (
             resolved_path,
-            f"抱歉，普通用户只能{operation}配置目录、Agent记忆目录和日志目录内的文件或目录：{allowed_text}",
+            f"抱歉，普通用户只能{operation}Agent配置目录和日志目录内的文件或目录：{allowed_text}",
         )
 
     async def _check_local_storage_access(
@@ -515,8 +509,8 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
         return (
             "抱歉，您没有执行此工具的权限。"
             "只有渠道管理员或系统管理员才能执行工具操作。"
-            "如需执行工具，请联系渠道管理员将您的用户ID添加到渠道管理员列表中，"
-            "或联系系统管理员为您设置权限。"
+            "如需执行工具，请联系管理员将您的用户ID添加到渠道管理员列表中（设定 -> 通知 -> 对应渠道配置 -> 管理员名单），"
+            "或联系系统管理员为您设置管理员权限。"
         )
 
     async def _has_channel_admin_permission(self) -> bool:
@@ -655,5 +649,6 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
                 title=title,
                 text=message,
                 image=image,
+                save_history=False,
             )
         )

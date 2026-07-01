@@ -197,18 +197,44 @@ def is_subagent_stream_metadata(metadata: Any) -> bool:
     ) == SUBAGENT_STREAM_MARKER_VALUE:
         return True
 
-    return bool(metadata.get("lc_agent_name") in builtin_subagent_names())
+    return bool(
+        metadata.get("lc_agent_name")
+        in builtin_subagent_names(agent_runtime_manager.current_signature())
+    )
 
 
-@lru_cache(maxsize=1)
-def builtin_subagent_names() -> frozenset[str]:
+def builtin_subagent_names(
+    runtime_signature: Optional[tuple[tuple[str, int, int], ...]] = None,
+) -> frozenset[str]:
     """返回内置子代理名称集合。"""
-    return frozenset(profile.name for profile in _builtin_subagent_profiles())
+    runtime_signature = runtime_signature or agent_runtime_manager.current_signature()
+    return _cached_builtin_subagent_names(runtime_signature)
 
 
-@lru_cache(maxsize=1)
-def _builtin_subagent_profiles() -> tuple[_SubAgentProfile, ...]:
+@lru_cache(maxsize=8)
+def _cached_builtin_subagent_names(
+    runtime_signature: tuple[tuple[str, int, int], ...],
+) -> frozenset[str]:
+    """按运行时签名缓存内置子代理名称集合。"""
+    return frozenset(
+        profile.name
+        for profile in _builtin_subagent_profiles(runtime_signature)
+    )
+
+
+def _builtin_subagent_profiles(
+    runtime_signature: Optional[tuple[tuple[str, int, int], ...]] = None,
+) -> tuple[_SubAgentProfile, ...]:
     """从运行时配置目录加载 MoviePilot 子代理定义。"""
+    runtime_signature = runtime_signature or agent_runtime_manager.current_signature()
+    return _cached_builtin_subagent_profiles(runtime_signature)
+
+
+@lru_cache(maxsize=8)
+def _cached_builtin_subagent_profiles(
+    runtime_signature: tuple[tuple[str, int, int], ...],
+) -> tuple[_SubAgentProfile, ...]:
+    """按运行时签名缓存 MoviePilot 子代理定义。"""
     definitions = agent_runtime_manager.list_subagents()
     profiles = tuple(
         _profile_from_runtime_definition(definition)
@@ -235,6 +261,10 @@ def _builtin_subagent_profiles() -> tuple[_SubAgentProfile, ...]:
             ),
         ),
     )
+
+
+builtin_subagent_names.cache_clear = _cached_builtin_subagent_names.cache_clear
+_builtin_subagent_profiles.cache_clear = _cached_builtin_subagent_profiles.cache_clear
 
 
 def _profile_from_runtime_definition(
@@ -311,6 +341,31 @@ def _format_datetime(value: Optional[datetime]) -> Optional[str]:
     if not value:
         return None
     return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _extract_tool_call_args(request: ToolCallRequest) -> dict[str, Any]:
+    """提取工具调用参数，并规整为字典。"""
+    tool_call = request.tool_call or {}
+    tool_args = tool_call.get("args") or {}
+    if not isinstance(tool_args, dict):
+        return {}
+    return tool_args
+
+
+def _record_subagent_tool_call(
+    *,
+    stream_handler: Any,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> None:
+    """在流式处理器中记录子代理工具调用摘要。"""
+    if not stream_handler or not getattr(stream_handler, "is_streaming", False):
+        return
+    stream_handler.record_tool_call(
+        tool_name=tool_name,
+        tool_message="Subagent invoked",
+        tool_kwargs=tool_args,
+    )
 
 
 class _SubAgentAgentProvider:
@@ -409,8 +464,10 @@ class MoviePilotSubAgentMiddleware(AgentMiddleware):
         tools: list[BaseTool],
         system_prompt: str = SUBAGENT_PARENT_PROMPT,
         task_description: str = SUBAGENT_TASK_DESCRIPTION,
+        stream_handler: Any = None,
     ) -> None:
         self.system_prompt = system_prompt
+        self.stream_handler = stream_handler
         self._provider = _SubAgentAgentProvider(
             model=model,
             profiles=profiles,
@@ -453,6 +510,35 @@ class MoviePilotSubAgentMiddleware(AgentMiddleware):
         )
         return await handler(request.override(system_message=new_system_message))
 
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[Any]],
+    ) -> Any:
+        """在 task 子代理工具执行时记录聚合摘要。"""
+        tool = request.tool
+        tool_name = getattr(tool, "name", None)
+        if tool_name != SUBAGENT_TASK_TOOL_NAME:
+            return await handler(request)
+
+        tool_args = _extract_tool_call_args(request)
+        logger.info(
+            f"开始执行子代理工具: tool_name={tool_name}, "
+            f"subagent_type={tool_args.get('subagent_type') or '-'}"
+        )
+        _record_subagent_tool_call(
+            stream_handler=self.stream_handler,
+            tool_name=SUBAGENT_TASK_TOOL_NAME,
+            tool_args=tool_args,
+        )
+        try:
+            result = await handler(request)
+        except Exception as err:
+            logger.error(f"子代理工具执行失败: tool_name={tool_name}, error={err}")
+            raise
+        logger.info(f"子代理工具执行完成: tool_name={tool_name}")
+        return result
+
 
 class SubAgentTaskControlMiddleware(AgentMiddleware):
     """提供异步子代理任务调度工具的中间件。"""
@@ -464,8 +550,10 @@ class SubAgentTaskControlMiddleware(AgentMiddleware):
         profiles: tuple[_SubAgentProfile, ...],
         tools: list[BaseTool],
         task_description: str = SUBAGENT_CONTROL_DESCRIPTION,
+        stream_handler: Any = None,
     ) -> None:
         """初始化异步子代理调度中间件。"""
+        self.stream_handler = stream_handler
         self._provider = _SubAgentAgentProvider(
             model=model,
             profiles=profiles,
@@ -986,97 +1074,37 @@ class SubAgentTaskControlMiddleware(AgentMiddleware):
         if unfinished_records:
             logger.info(f"Agent 结束，取消未完成子代理任务: tasks={len(unfinished_records)}")
         await self._cancel_records(unfinished_records)
-
-
-class SubAgentCallSummaryMiddleware(AgentMiddleware):
-    """记录子代理调用次数的中间件。"""
-
-    def __init__(self, *, stream_handler: Any = None) -> None:
-        self.stream_handler = stream_handler
-        self.tools = []
+        self._tasks.clear()
 
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[Any]],
     ) -> Any:
-        """在子代理任务工具执行时记录聚合摘要。"""
+        """在 subagent_task 子代理工具执行时记录聚合摘要。"""
         tool = request.tool
         tool_name = getattr(tool, "name", None)
-        is_subagent_tool = tool_name in {
-            SUBAGENT_TASK_TOOL_NAME,
-            SUBAGENT_CONTROL_TOOL_NAME,
-        }
-        if is_subagent_tool:
-            tool_call = request.tool_call or {}
-            tool_args = tool_call.get("args") or {}
-            if not isinstance(tool_args, dict):
-                tool_args = {}
-            logger.info(
-                f"开始执行子代理工具: tool_name={tool_name}, "
-                f"action={tool_args.get('action') or '-'}, "
-                f"subagent_type={tool_args.get('subagent_type') or '-'}"
-            )
-            if (
-                self.stream_handler
-                and getattr(self.stream_handler, "is_streaming", False)
-            ):
-                self.stream_handler.record_tool_call(
-                    tool_name=tool_name or SUBAGENT_TASK_TOOL_NAME,
-                    tool_message="Subagent invoked",
-                    tool_kwargs=tool_args,
-                )
+        if tool_name != SUBAGENT_CONTROL_TOOL_NAME:
+            return await handler(request)
+
+        tool_args = _extract_tool_call_args(request)
+        logger.info(
+            f"开始执行子代理工具: tool_name={tool_name}, "
+            f"action={tool_args.get('action') or '-'}, "
+            f"subagent_type={tool_args.get('subagent_type') or '-'}"
+        )
+        _record_subagent_tool_call(
+            stream_handler=self.stream_handler,
+            tool_name=SUBAGENT_CONTROL_TOOL_NAME,
+            tool_args=tool_args,
+        )
         try:
             result = await handler(request)
         except Exception as err:
-            if is_subagent_tool:
-                logger.error(f"子代理工具执行失败: tool_name={tool_name}, error={err}")
+            logger.error(f"子代理工具执行失败: tool_name={tool_name}, error={err}")
             raise
-        if is_subagent_tool:
-            logger.info(f"子代理工具执行完成: tool_name={tool_name}")
+        logger.info(f"子代理工具执行完成: tool_name={tool_name}")
         return result
-
-
-def _deepagents_spec(
-    profiles: tuple[_SubAgentProfile, ...], tools: list[BaseTool]
-) -> list[dict[str, Any]]:
-    """将内置定义转换为 Deep Agents 子代理配置。"""
-    specs = []
-    for profile in profiles:
-        specs.append(
-            {
-                "name": profile.name,
-                "description": profile.description,
-                "prompt": profile.prompt,
-                "tools": _select_tools(tools, profile),
-            }
-        )
-    return specs
-
-
-def _try_create_deepagents_middleware(
-    *,
-    profiles: tuple[_SubAgentProfile, ...],
-    tools: list[BaseTool],
-    model: BaseChatModel,
-) -> Optional[AgentMiddleware]:
-    """优先创建 Deep Agents 官方子代理中间件。"""
-    try:
-        from deepagents.backends import StateBackend
-        from deepagents.middleware.subagents import SubAgentMiddleware
-
-        return SubAgentMiddleware(
-            backend=StateBackend(),
-            subagents=_deepagents_spec(profiles, tools),
-            default_model=model,
-            system_prompt=SUBAGENT_PARENT_PROMPT,
-            task_description=SUBAGENT_TASK_DESCRIPTION,
-        )
-    except ImportError:
-        return None
-    except Exception as err:
-        logger.debug(f"Deep Agents 子代理中间件不可用，使用本地实现: {err}")
-        return None
 
 
 def create_subagent_middlewares(
@@ -1086,24 +1114,19 @@ def create_subagent_middlewares(
     stream_handler: Any = None,
 ) -> tuple[list[AgentMiddleware], list[BaseTool]]:
     """创建子代理中间件列表和任务工具列表。"""
-    _builtin_subagent_profiles.cache_clear()
-    builtin_subagent_names.cache_clear()
-    profiles = _builtin_subagent_profiles()
-    subagent_middleware = _try_create_deepagents_middleware(
+    runtime_signature = agent_runtime_manager.current_signature()
+    profiles = _builtin_subagent_profiles(runtime_signature)
+    subagent_middleware = MoviePilotSubAgentMiddleware(
+        model=model,
         profiles=profiles,
         tools=tools,
-        model=model,
+        stream_handler=stream_handler,
     )
-    if subagent_middleware is None:
-        subagent_middleware = MoviePilotSubAgentMiddleware(
-            model=model,
-            profiles=profiles,
-            tools=tools,
-        )
     control_middleware = SubAgentTaskControlMiddleware(
         model=model,
         profiles=profiles,
         tools=tools,
+        stream_handler=stream_handler,
     )
 
     task_tools = [
@@ -1113,7 +1136,6 @@ def create_subagent_middlewares(
     return [
         subagent_middleware,
         control_middleware,
-        SubAgentCallSummaryMiddleware(stream_handler=stream_handler),
     ], task_tools
 
 
