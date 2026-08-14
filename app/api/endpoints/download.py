@@ -1,4 +1,4 @@
-from typing import Any, List, Annotated, Optional
+from typing import Any, List, Annotated, Literal, Optional
 
 from fastapi import APIRouter, Depends, Body
 
@@ -9,12 +9,40 @@ from app.core.context import MediaInfo, Context, SubtitleInfo, TorrentInfo
 from app.core.metainfo import MetaInfo
 from app.core.security import verify_token
 from app.db.models.user import User
+from app.db.site_oper import SiteOper
 from app.db.systemconfig_oper import SystemConfigOper
 from app.db.user_oper import get_current_active_user
 from app.helper.directory import DirectoryHelper
 from app.schemas.types import SystemConfigKey
+from app.utils.security import SecurityUtils
 
 router = APIRouter()
+MediaSource = Literal["themoviedb", "douban", "bangumi", "anilist"]
+
+
+def _prepare_subtitle_download(subtitle: SubtitleInfo) -> tuple[bool, str]:
+    """
+    校验字幕下载签名，并用服务端站点配置覆盖请求凭据。
+    """
+    if subtitle.site is None:
+        return False, "字幕站点信息为空"
+
+    clean_url = SecurityUtils.verify_signed_url(
+        subtitle.enclosure,
+        purpose=SecurityUtils.subtitle_download_purpose(subtitle.site),
+    )
+    if not clean_url:
+        return False, "字幕下载链接签名无效"
+
+    site = SiteOper().get(subtitle.site)
+    if not site:
+        return False, "字幕站点信息不存在"
+
+    subtitle.enclosure = clean_url
+    subtitle.site_cookie = site.cookie
+    subtitle.site_ua = site.ua
+    subtitle.site_proxy = bool(site.proxy)
+    return True, ""
 
 
 @router.get("/", summary="正在下载", response_model=List[schemas.DownloaderTorrent])
@@ -70,6 +98,10 @@ def add(
     torrent_in: schemas.TorrentInfo,
     tmdbid: Annotated[int | None, Body()] = None,
     doubanid: Annotated[str | None, Body()] = None,
+    bangumiid: Annotated[int | None, Body()] = None,
+    anilistid: Annotated[int | None, Body()] = None,
+    media_source: Annotated[MediaSource | None, Body()] = None,
+    media_id: Annotated[str | None, Body()] = None,
     downloader: Annotated[str | None, Body()] = None,
     # 保存路径, 支持<storage>:<path>, 如rclone:/MP, smb:/server/share/Movies等
     save_path: Annotated[str | None, Body()] = None,
@@ -81,15 +113,20 @@ def add(
     # 元数据
     metainfo = MetaInfo(title=torrent_in.title, subtitle=torrent_in.description)
     # 媒体信息
-    if tmdbid or doubanid:
+    if tmdbid or doubanid or bangumiid or anilistid or media_id:
         mediainfo = MediaChain().recognize_media(
             meta=metainfo,
+            source=media_source,
+            mediaid=media_id,
             tmdbid=tmdbid,
             doubanid=doubanid,
+            bangumiid=bangumiid,
+            anilistid=anilistid,
         )
     else:
         mediainfo = MediaChain().recognize_by_meta(
             metainfo,
+            source=media_source,
             obtain_images=False,
         )
     if not mediainfo:
@@ -119,6 +156,10 @@ def download_subtitle(
     subtitle_in: schemas.SubtitleInfo,
     tmdbid: Annotated[int | None, Body()] = None,
     doubanid: Annotated[str | None, Body()] = None,
+    bangumiid: Annotated[int | None, Body()] = None,
+    anilistid: Annotated[int | None, Body()] = None,
+    media_source: Annotated[MediaSource | None, Body()] = None,
+    media_id: Annotated[str | None, Body()] = None,
     save_path: Annotated[str | None, Body()] = None,
     current_user: User = Depends(get_current_active_user),
 ) -> Any:
@@ -127,10 +168,18 @@ def download_subtitle(
     """
     subtitle_info = SubtitleInfo()
     subtitle_info.from_dict(subtitle_in.model_dump())
+    valid, message = _prepare_subtitle_download(subtitle_info)
+    if not valid:
+        return schemas.Response(success=False, message=message)
+
     success, message, saved_files = DownloadChain().download_subtitle(
         subtitle=subtitle_info,
+        media_source=media_source,
+        media_id=media_id,
         tmdbid=tmdbid,
         doubanid=doubanid,
+        bangumiid=bangumiid,
+        anilistid=anilistid,
         save_path=save_path,
         username=current_user.name,
     )

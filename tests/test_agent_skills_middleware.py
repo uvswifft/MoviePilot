@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 from anyio import Path as AsyncPath
@@ -6,6 +7,7 @@ from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import SystemMessage
 
 from app.agent.middleware.skills import (
+    MAX_SKILL_RESULT_CHARS,
     SKILL_TOOL_NAME,
     SkillsMiddleware,
     _alist_skills,
@@ -80,6 +82,24 @@ async def test_skill_tool_loads_skill_by_id_and_name(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_skill_tool_caps_large_result_before_model_context(tmp_path):
+    """超大 Skill 内容应在工具返回前限制到模型上下文上限。"""
+    _write_skill(tmp_path, "large-skill")
+    skill_path = tmp_path / "large-skill" / "SKILL.md"
+    with skill_path.open("a", encoding="utf-8") as file_handle:
+        file_handle.write("\n" + ("large-line\n" * 30000))
+
+    middleware = SkillsMiddleware(sources=[str(tmp_path)])
+    result = await middleware.tools[0].ainvoke({"name": "large-skill"})
+    payload = json.loads(result)
+
+    assert len(result) <= MAX_SKILL_RESULT_CHARS
+    assert payload["success"] is True
+    assert payload["truncated"] is True
+    assert "Skill 内容已截断" in payload["content"]
+
+
+@pytest.mark.anyio
 async def test_skill_tool_returns_not_found_for_unknown_skill(tmp_path):
     """skill 工具找不到技能时应返回结构化失败信息。"""
     middleware = SkillsMiddleware(sources=[str(tmp_path)])
@@ -111,3 +131,43 @@ def test_modify_request_instructs_model_to_use_skill_tool_without_paths(tmp_path
     assert "moviepilot-cli" in system_content
     assert "Read `" not in system_content
     assert str(tmp_path) not in system_content
+
+
+@pytest.mark.anyio
+async def test_skill_tool_call_records_streaming_summary(tmp_path):
+    """skill 工具执行时应记录流式聚合摘要。"""
+    _write_skill(tmp_path, "moviepilot-cli")
+    calls = []
+    stream_handler = SimpleNamespace(
+        is_streaming=True,
+        record_tool_call=lambda **kwargs: calls.append(kwargs),
+    )
+    middleware = SkillsMiddleware(
+        sources=[str(tmp_path)],
+        stream_handler=stream_handler,
+    )
+    request = SimpleNamespace(
+        tool=SimpleNamespace(name=SKILL_TOOL_NAME),
+        tool_call={
+            "args": {
+                "name": "moviepilot-cli",
+            }
+        },
+    )
+
+    async def _fake_handler(_request):
+        """返回模拟工具结果。"""
+        return "ok"
+
+    result = await middleware.awrap_tool_call(request, _fake_handler)
+
+    assert result == "ok"
+    assert calls == [
+        {
+            "tool_name": SKILL_TOOL_NAME,
+            "tool_message": "Skill loaded",
+            "tool_kwargs": {
+                "name": "moviepilot-cli",
+            },
+        }
+    ]

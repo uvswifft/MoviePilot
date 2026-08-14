@@ -3,16 +3,19 @@
 
 按日期存储在 CONFIG_PATH/agent/activity/YYYY-MM-DD.md 中，
 每次 Agent 执行完毕后自动调用 LLM 对本轮对话生成简洁的活动摘要，
-并在每次 Agent 启动时注入轻量索引，完整日志由工具按需查询。
+系统提示词只注入稳定的检索规则，完整日志由工具按需查询。
 """
 
+import asyncio
 import json
+import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, NotRequired, Optional, TypedDict
 
+import anyio
 from anyio import Path as AsyncPath
 from langchain.agents.middleware.types import (
     AgentMiddleware,
@@ -22,6 +25,7 @@ from langchain.agents.middleware.types import (
     ModelResponse,
     PrivateStateAttr,  # noqa
     ResponseT,
+    ToolCallRequest,
 )
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
@@ -85,10 +89,6 @@ ACTIVITY_ENTRY_PATTERN = re.compile(r"^-\s+\*\*(?P<time>\d{2}:\d{2})\*\*\s+(?P<s
 class QueryActivityLogInput(BaseModel):
     """查询活动日志工具的输入参数模型。"""
 
-    explanation: Optional[str] = Field(
-        None,
-        description="Clear explanation of why this tool is being used in the current context",
-    )
     keyword: Optional[str] = Field(
         None,
         description=(
@@ -285,17 +285,15 @@ class _ActivityLogToolProvider:
         date: Optional[str] = None,
         days: Optional[int] = DEFAULT_QUERY_DAYS,
         limit: Optional[int] = DEFAULT_QUERY_LIMIT,
-        explanation: Optional[str] = None,
     ) -> str:
         """查询活动日志并返回 JSON 字符串。"""
         logger.info(
-            "查询活动日志: keyword=%s, use_regex=%s, date=%s, days=%s, limit=%s, explanation=%s",
+            "查询活动日志: keyword=%s, use_regex=%s, date=%s, days=%s, limit=%s",
             keyword,
             use_regex,
             date,
             days,
             limit,
-            explanation or "-",
         )
         try:
             payload = query_activity_logs(
@@ -449,7 +447,7 @@ async def _summarize_with_llm(conversation_text: str) -> Optional[str]:
         llm = await LLMHelper.get_llm(streaming=False)
         prompt = SUMMARY_PROMPT.format(conversation=conversation_text)
         response = await llm.ainvoke(prompt)
-        summary = response.content.strip()
+        summary = LLMHelper.extract_text_content(response.content).strip()
         # 清理模型可能输出的前缀（如 "摘要：" "总结："）
         summary = re.sub(r"^(摘要|总结|活动记录)[：:]\s*", "", summary)
         if summary.strip().upper() == SUMMARY_SKIP_MARKER:
@@ -461,12 +459,8 @@ async def _summarize_with_llm(conversation_text: str) -> Optional[str]:
 
 
 ACTIVITY_LOG_SYSTEM_PROMPT = """<activity_log>
-<activity_log_index>
-{activity_log_index}
-</activity_log_index>
-
 <activity_log_guidelines>
-    The index only shows recent dates and entry counts, not full log contents.
+    Activity log contents and indexes are not included in the default context.
     Use `query_activity_log` only when the user references previous work, asks to continue a prior task, or recent activity is clearly relevant.
     Activity logs are read-only and retained for {retention_days} days; use MEMORY.md for durable preferences.
 </activity_log_guidelines>
@@ -475,10 +469,10 @@ ACTIVITY_LOG_SYSTEM_PROMPT = """<activity_log>
 
 
 class ActivityLogMiddleware(AgentMiddleware[ActivityLogState, ContextT, ResponseT]):  # noqa
-    """自动记录 Agent 活动日志并注入轻量索引的中间件。
+    """自动记录 Agent 活动日志并注入稳定检索规则的中间件。
 
     - abefore_agent: 加载近几天的活动日志索引
-    - awrap_model_call: 将活动日志索引和检索规则注入系统提示词
+    - awrap_model_call: 将固定的活动日志检索规则注入系统提示词
     - aafter_agent: 从本次对话中提取摘要并追加到当日日志文件
 
     参数：
@@ -495,10 +489,14 @@ class ActivityLogMiddleware(AgentMiddleware[ActivityLogState, ContextT, Response
         activity_dir: str,
         retention_days: int = DEFAULT_RETENTION_DAYS,
         prompt_load_days: int = PROMPT_LOAD_DAYS,
+        stream_handler: Optional[Any] = None,
     ) -> None:
+        """初始化活动日志中间件。"""
         self.activity_dir = activity_dir
         self.retention_days = retention_days
         self.prompt_load_days = prompt_load_days
+        self.stream_handler = stream_handler
+        self._background_tasks: set[asyncio.Task[None]] = set()
         self._tool_provider = _ActivityLogToolProvider(activity_dir=activity_dir)
         self.tools = [
             StructuredTool.from_function(
@@ -514,31 +512,9 @@ class ActivityLogMiddleware(AgentMiddleware[ActivityLogState, ContextT, Response
         """获取指定日期的日志文件路径。"""
         return AsyncPath(self.activity_dir) / f"{date_str}.md"
 
-    def _format_activity_log(self, contents: dict[str, str]) -> str:
-        """格式化活动日志索引用于系统提示词注入。"""
-        if not contents:
-            return ACTIVITY_LOG_SYSTEM_PROMPT.format(
-                activity_log_index="(近期暂无活动日志索引。需要历史上下文时可调用 query_activity_log。)",
-                retention_days=self.retention_days,
-            )
-
-        # 按日期排序（最近的在前）
-        sorted_dates = sorted(contents.keys(), reverse=True)
-        sections = []
-        for date_str in sorted_dates:
-            content = contents[date_str].strip()
-            if content:
-                sections.append(f"### {date_str}\n{content}")
-
-        if not sections:
-            return ACTIVITY_LOG_SYSTEM_PROMPT.format(
-                activity_log_index="(近期暂无活动日志索引。需要历史上下文时可调用 query_activity_log。)",
-                retention_days=self.retention_days,
-            )
-
-        log_body = "\n".join(sections)
+    def _format_activity_log(self, _contents: dict[str, str]) -> str:
+        """生成不受活动日志内容变化影响的系统提示词。"""
         return ACTIVITY_LOG_SYSTEM_PROMPT.format(
-            activity_log_index=log_body,
             retention_days=self.retention_days,
         )
 
@@ -575,14 +551,29 @@ class ActivityLogMiddleware(AgentMiddleware[ActivityLogState, ContextT, Response
         entry = f"- **{now_str}** {summary}\n"
         try:
             if await log_path.exists():
-                existing = await log_path.read_text(encoding="utf-8", errors="replace")
-                await log_path.write_text(existing + entry, encoding="utf-8")
+                async with await anyio.open_file(
+                    log_path,
+                    mode="a",
+                    encoding="utf-8",
+                ) as stream:
+                    await stream.write(entry)
             else:
                 header = f"# {today_str} 活动日志\n\n"
-                await log_path.write_text(header + entry, encoding="utf-8")
-            logger.debug("Activity logged: %s", summary[:80])
+                try:
+                    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                except FileExistsError:
+                    async with await anyio.open_file(
+                        log_path,
+                        mode="a",
+                        encoding="utf-8",
+                    ) as stream:
+                        await stream.write(entry)
+                else:
+                    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                        stream.write(header + entry)
+            logger.debug(f"Activity logged: {summary[:80]}")
         except Exception as e:
-            logger.warning("Failed to append activity log: %s", e)
+            logger.warning(f"Failed to append activity log: {e}")
 
     async def _cleanup_old_logs(self) -> None:
         """清理超过保留天数的旧日志文件。"""
@@ -604,20 +595,54 @@ class ActivityLogMiddleware(AgentMiddleware[ActivityLogState, ContextT, Response
                     file_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
                     if file_date < cutoff_date:
                         await path.unlink()
-                        logger.debug("Cleaned up old activity log: %s", path.name)
+                        logger.debug(f"Cleaned up old activity log: {path.name}")
                 except ValueError:
                     continue
         except Exception as e:
-            logger.warning("Failed to cleanup old activity logs: %s", e)
+            logger.warning(f"Failed to cleanup old activity logs: {e}")
+
+    def _schedule_activity_recording(self, messages: list) -> None:
+        """提交后台活动记录任务，不阻塞当前 Agent 会话结束。"""
+        task = asyncio.create_task(self._record_activity(messages))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_activity_recording_done)
+
+    def _on_activity_recording_done(self, task: asyncio.Task[None]) -> None:
+        """清理已完成的后台任务并记录未捕获异常。"""
+        self._background_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.debug("活动日志后台记录任务已取消")
+        except Exception as err:
+            logger.warning(f"活动日志后台记录任务失败: {err}")
+
+    async def _record_activity(self, messages: list) -> None:
+        """在后台生成本轮活动摘要并写入活动日志。"""
+        try:
+            # 提取本轮交互
+            round_messages = _extract_last_round(messages)
+            if not round_messages:
+                return
+            if _should_skip_activity_summary(round_messages):
+                return
+
+            # 格式化对话文本
+            conversation_text = _format_conversation_for_summary(round_messages)
+            if not conversation_text:
+                return
+
+            # 调用 LLM 生成摘要
+            summary = await _summarize_with_llm(conversation_text)
+            if summary:
+                await self._append_activity(summary)
+        except Exception as e:
+            logger.warning(f"Failed to record activity: {e}")
 
     async def abefore_agent(
         self, state: ActivityLogState, runtime: Runtime
     ) -> Optional[ActivityLogStateUpdate]:
         """在 Agent 执行前加载近期活动日志。"""
-        # 如果已经加载则跳过
-        if "activity_log_contents" in state:
-            return None
-
         contents = await self._load_recent_logs()
 
         # 趁机清理旧日志（低频操作，不影响性能）
@@ -646,33 +671,50 @@ class ActivityLogMiddleware(AgentMiddleware[ActivityLogState, ContextT, Response
         modified_request = self.modify_request(request)
         return await handler(modified_request)
 
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[Any]],
+    ) -> Any:
+        """在活动日志查询工具执行时记录聚合摘要。"""
+        tool = request.tool
+        tool_name = getattr(tool, "name", None)
+        if tool_name != QUERY_ACTIVITY_LOG_TOOL_NAME:
+            return await handler(request)
+
+        tool_call = request.tool_call or {}
+        tool_args = tool_call.get("args") or {}
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+        logger.info(
+            f"开始执行活动日志查询工具: keyword={tool_args.get('keyword') or '-'}, "
+            f"date={tool_args.get('date') or '-'}"
+        )
+        if self.stream_handler and getattr(self.stream_handler, "is_streaming", False):
+            self.stream_handler.record_tool_call(
+                tool_name=QUERY_ACTIVITY_LOG_TOOL_NAME,
+                tool_message=QUERY_ACTIVITY_LOG_TOOL_DESCRIPTION,
+                tool_kwargs=tool_args,
+            )
+        try:
+            result = await handler(request)
+        except Exception as err:
+            logger.error(f"活动日志查询工具执行失败: error={err}")
+            raise
+        logger.info("活动日志查询工具执行完成")
+        return result
+
     async def aafter_agent(
         self, state: ActivityLogState, runtime: Runtime
     ) -> Optional[dict[str, Any]]:
-        """Agent 执行完毕后，调用 LLM 对本轮对话生成摘要并追加到当日活动日志。"""
+        """Agent 执行完毕后，异步提交活动日志记录任务。"""
         try:
             messages = state.get("messages", [])
             if not messages:
                 return None
-
-            # 提取本轮交互
-            round_messages = _extract_last_round(messages)
-            if not round_messages:
-                return None
-            if _should_skip_activity_summary(round_messages):
-                return None
-
-            # 格式化对话文本
-            conversation_text = _format_conversation_for_summary(round_messages)
-            if not conversation_text:
-                return None
-
-            # 调用 LLM 生成摘要
-            summary = await _summarize_with_llm(conversation_text)
-            if summary:
-                await self._append_activity(summary)
+            self._schedule_activity_recording(list(messages))
         except Exception as e:
-            logger.warning("Failed to record activity: %s", e)
+            logger.warning(f"Failed to record activity: {e}")
 
         return None
 

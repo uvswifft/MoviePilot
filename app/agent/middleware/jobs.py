@@ -204,9 +204,14 @@ You have a scheduled jobs system for user-requested delayed or recurring work.
 {jobs_list}
 
 Rules:
-- Create jobs only when the user asks for delayed, recurring, reminder, or monitoring behavior.
-- Do not create jobs for immediate one-time work or work already handled by MoviePilot schedulers.
-- Each job lives in its own directory with a `JOB.md`; read the listed file before executing or updating an active job.
+- For new delayed, recurring, reminder, or monitoring work, use the dedicated
+  `create_agent_task`, `query_agent_tasks`, `update_agent_task`, `run_agent_task`,
+  and `delete_agent_task` tools. These tools use integer task IDs. Do not create
+  or edit JOB.md files for new tasks.
+- Use `query_schedulers` and `run_scheduler` only for MoviePilot system, plugin,
+  or workflow runtime services; never pass their string job IDs to Agent task tools.
+- Do not create tasks for immediate one-time work or work already handled by MoviePilot schedulers.
+- Entries listed above are legacy JOB.md tasks. Read their files only when a heartbeat asks you to execute them.
 - During heartbeat checks, act only on `pending` or `in_progress` jobs, update status/last_run/logs, and leave recurring jobs `pending` after each run.
 </jobs_system>
 """
@@ -230,7 +235,7 @@ class JobsMiddleware(AgentMiddleware[JobsState, ContextT, ResponseT]):  # noqa
     def _format_jobs_list(jobs: list[JobMetadata]) -> str:
         """格式化任务元数据列表用于系统提示词。"""
         if not jobs:
-            return "(No active jobs. You can create jobs when users request periodic or scheduled tasks.)"
+            return "(No active legacy JOB.md tasks. Use create_agent_task for new scheduled work.)"
 
         lines = []
         for job in jobs:
@@ -283,12 +288,7 @@ class JobsMiddleware(AgentMiddleware[JobsState, ContextT, ResponseT]):  # noqa
     ) -> JobsStateUpdate | None:
         """在 Agent 执行前异步加载任务元数据。
 
-        每个会话仅加载一次。若 state 中已有则跳过。
         """
-        # 如果 state 中已存在元数据则跳过
-        if "jobs_metadata" in state:
-            return None
-
         return JobsStateUpdate(
             jobs_metadata=await load_jobs_metadata(self.sources)
         )

@@ -36,7 +36,10 @@ class LlmTestRequest(BaseModel):
     base_url: Optional[str] = None
     base_url_preset: Optional[str] = None
     user_agent: Optional[str] = None
+    temperature: Optional[float] = None
     use_proxy: Optional[bool] = None
+    api_protocol: Optional[str] = None
+    web_search_mode: Optional[str] = None
 
 
 class LlmProviderAuthStartRequest(BaseModel):
@@ -48,7 +51,7 @@ class LlmProviderAuthStartRequest(BaseModel):
     method: str
 
 
-def _sanitize_llm_test_error(message: str, api_key: Optional[str] = None) -> str:
+def _sanitize_llm_error(message: str, api_key: Optional[str] = None) -> str:
     """
     清理错误信息中的敏感字段，避免回显密钥。
     """
@@ -70,11 +73,14 @@ def _sanitize_llm_test_error(message: str, api_key: Optional[str] = None) -> str
     )
 
     normalized_message = sanitized.lower().replace("_", "").replace(" ", "")
-    if "str" in normalized_message and "modeldump" in normalized_message:
+    if "str" in normalized_message and (
+        "modeldump" in normalized_message
+        or "setprivateattributes" in normalized_message
+    ):
         return (
-            "服务返回内容不是兼容的模型响应，"
-            "请检查基础地址是否填写为 API Base URL，不要填写网页地址或完整的 "
-            "chat/completions 路径"
+            "服务返回内容不是兼容的模型响应，请检查基础地址是否填写为 "
+            "API Base URL，如果服务要求 /v1 等版本路径，请包含在基础地址中，"
+            "不要填写网页地址或完整的 chat/completions 路径"
         )
     return sanitized
 
@@ -113,7 +119,10 @@ async def get_llm_models(
             },
         )
     except Exception as err:
-        return schemas.Response(success=False, message=str(err))
+        return schemas.Response(
+            success=False,
+            message=_sanitize_llm_error(str(err), api_key),
+        )
 
 
 @router.get("/providers", summary="获取LLM提供商目录", response_model=schemas.Response)
@@ -262,6 +271,8 @@ async def llm_test(
         base_url_preset=settings.LLM_BASE_URL_PRESET,
         user_agent=settings.LLM_USER_AGENT,
         use_proxy=settings.LLM_USE_PROXY,
+        api_protocol=settings.LLM_API_PROTOCOL,
+        web_search_mode=settings.LLM_WEB_SEARCH_MODE,
     )
 
     if not payload.provider:
@@ -286,16 +297,22 @@ async def llm_test(
         )
 
     try:
-        result = await LLMHelper.test_current_settings(
-            provider=payload.provider,
-            model=payload.model,
-            thinking_level=payload.thinking_level,
-            api_key=payload.api_key,
-            base_url=payload.base_url,
-            base_url_preset=payload.base_url_preset,
-            user_agent=payload.user_agent,
-            use_proxy=payload.use_proxy,
-        )
+        test_kwargs = {
+            "provider": payload.provider,
+            "model": payload.model,
+            "thinking_level": payload.thinking_level,
+            "api_key": payload.api_key,
+            "base_url": payload.base_url,
+            "base_url_preset": payload.base_url_preset,
+            "user_agent": payload.user_agent,
+            "use_proxy": payload.use_proxy,
+            "api_protocol": payload.api_protocol,
+            "web_search_mode": payload.web_search_mode,
+        }
+        if payload.temperature is not None:
+            test_kwargs["temperature"] = payload.temperature
+
+        result = await LLMHelper.test_current_settings(**test_kwargs)
         if not result.get("reply_preview"):
             return schemas.Response(
                 success=False,
@@ -312,5 +329,5 @@ async def llm_test(
     except Exception as err:
         return schemas.Response(
             success=False,
-            message=_sanitize_llm_test_error(str(err), payload.api_key),
+            message=_sanitize_llm_error(str(err), payload.api_key),
         )

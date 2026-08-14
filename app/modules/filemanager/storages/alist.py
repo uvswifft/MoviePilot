@@ -47,7 +47,10 @@ class Alist(StorageBase, metaclass=WeakSingleton):
         """
         初始化
         """
-        self.__generate_token.cache_clear()  # noqa
+        conf = self.get_conf()
+        self.__login_token.cache_delete(  # noqa
+            self, self.__get_base_url, conf.get("username"), conf.get("password")
+        )
 
     def _delay_get_item(
         self, path: Path, /, refresh: bool = False
@@ -117,22 +120,32 @@ class Alist(StorageBase, metaclass=WeakSingleton):
         """
         return self.__generate_token()
 
-    @cached(maxsize=1, ttl=60 * 60 * 24 * 2 - 60 * 5, skip_empty=True)
     def __generate_token(self) -> str:
         """
         如果设置永久令牌则返回永久令牌，否则使用账号密码生成一个临时 token
-        缓存2天，提前5分钟更新
         """
         conf = self.get_conf()
         token = conf.get("token")
         if token:
             return str(token)
+        return self.__login_token(
+            self.__get_base_url, conf.get("username"), conf.get("password")
+        )
+
+    @cached(maxsize=8, ttl=60 * 60 * 24 * 2 - 60 * 5, skip_empty=True)
+    def __login_token(
+        self, base_url: str, username: Optional[str], password: Optional[str]
+    ) -> str:
+        """
+        使用账号密码生成一个临时 token
+        缓存2天，提前5分钟更新
+        """
         resp = RequestUtils(headers={"Content-Type": "application/json"}).post_res(
-            self.__get_api_url("/api/auth/login"),
+            UrlUtils.adapt_request_url(base_url, "/api/auth/login"),
             data=json.dumps(
                 {
-                    "username": conf.get("username"),
-                    "password": conf.get("password"),
+                    "username": username,
+                    "password": password,
                 }
             ),
         )
@@ -479,57 +492,24 @@ class Alist(StorageBase, metaclass=WeakSingleton):
         """
         return self.get_folder(Path(fileitem.path).parent)
 
-    def __is_empty_dir(self, fileitem: schemas.FileItem) -> bool:
-        """
-        判断目录是否为空
-
-        :param fileitem: 文件项
-        :return: 是否为空目录
-        """
-        if fileitem.type != "dir":
-            return False
-        # 获取目录内容
-        items = self.list(fileitem)
-        return len(items) == 0
-
     def delete(self, fileitem: schemas.FileItem) -> bool:
         """
-        删除文件或目录，空目录用专用API
+        删除文件或目录
 
         :param fileitem: 文件项
         :return: 是否删除成功
         """
-        # 如果是空目录，优先用 remove_empty_directory
-        if fileitem.type == "dir" and self.__is_empty_dir(fileitem):
-            resp = RequestUtils(headers=self.__get_header_with_token()).post_res(
-                self.__get_api_url("/api/fs/remove_empty_directory"),
-                json={
-                    "src_dir": fileitem.path,
-                },
-            )
-            if resp is None:
-                logger.warn(
-                    f"【OpenList】请求删除空目录 {fileitem.path} 失败，无法连接alist服务"
-                )
-                return False
-            if resp.status_code != 200:
-                logger.warn(
-                    f"【OpenList】请求删除空目录 {fileitem.path} 失败，状态码：{resp.status_code}"
-                )
-                return False
-            result = resp.json()
-            if result["code"] != 200:
-                logger.warn(
-                    f"【OpenList】删除空目录 {fileitem.path} 失败，错误信息：{result['message']}"
-                )
-                return False
-            return True
-        # 其它情况（文件或非空目录）
+        path = Path(fileitem.path)
+        name = fileitem.name or path.name
+        if not name:
+            logger.warn(f"【OpenList】删除路径 {fileitem.path} 无效")
+            return False
+
         resp = RequestUtils(headers=self.__get_header_with_token()).post_res(
             self.__get_api_url("/api/fs/remove"),
             json={
-                "dir": Path(fileitem.path).parent.as_posix(),
-                "names": [fileitem.name],
+                "dir": path.parent.as_posix(),
+                "names": [name],
             },
         )
         if resp is None:

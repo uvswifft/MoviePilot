@@ -3,7 +3,7 @@ import re
 import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Annotated, List, Optional
+from typing import Annotated, Any, List, Optional
 from typing import NotRequired, TypedDict
 
 import yaml  # noqa
@@ -15,6 +15,7 @@ from langchain.agents.middleware.types import (
     ModelRequest,
     ModelResponse,
     ResponseT,
+    ToolCallRequest,
 )
 from langchain.agents.middleware.types import PrivateStateAttr  # noqa
 from langchain_core.runnables import RunnableConfig
@@ -26,8 +27,10 @@ from app.agent.middleware.utils import append_to_system_message
 from app.agent.tools.tags import ToolTag
 from app.log import logger
 
-# 安全提示: SKILL.md 文件最大限制为 10MB，防止 DoS 攻击
-MAX_SKILL_FILE_SIZE = 10 * 1024 * 1024
+# 磁盘读取上限与模型返回上限分离，避免异常大的 Skill 文件撑爆内存或上下文。
+MAX_SKILL_FILE_SIZE = 1 * 1024 * 1024
+MAX_SKILL_RESULT_CHARS = 64 * 1024
+SKILL_CONTENT_TRUNCATION_SUFFIX = "\n...(Skill 内容已截断)"
 
 # Agent Skills 规范约束 (https://agentskills.io/specification)
 MAX_SKILL_NAME_LENGTH = 64
@@ -91,10 +94,6 @@ class SkillsStateUpdate(TypedDict):
 class SkillToolInput(BaseModel):
     """Skill 加载工具的输入参数模型。"""
 
-    explanation: Optional[str] = Field(
-        None,
-        description="Clear explanation of why this skill is needed in the current context",
-    )
     name: str = Field(
         ...,
         description="Skill name or id from the available skills list.",
@@ -251,7 +250,17 @@ async def _alist_skills(source_path: AsyncPath) -> list[SkillMetadata]:
     for skill_path in skill_dirs:
         skill_md_path = skill_path / "SKILL.md"
 
-        skill_content = await skill_md_path.read_text(encoding="utf-8", errors="replace")
+        stat = await skill_md_path.stat()
+        if stat.st_size > MAX_SKILL_FILE_SIZE:
+            logger.warning(
+                "Skipping %s: file too large (%d bytes)",
+                skill_md_path,
+                stat.st_size,
+            )
+            continue
+        skill_content = (await skill_md_path.read_bytes()).decode(
+            "utf-8", errors="replace"
+        )
 
         # 解析元数据
         skill_metadata = _parse_skill_metadata(
@@ -283,7 +292,16 @@ def _list_skills(source_path: Path) -> list[SkillMetadata]:
     skills: list[SkillMetadata] = []
     for skill_path in skill_dirs:
         skill_md_path = skill_path / "SKILL.md"
-        skill_content = skill_md_path.read_text(encoding="utf-8", errors="replace")
+        if skill_md_path.stat().st_size > MAX_SKILL_FILE_SIZE:
+            logger.warning(
+                "Skipping %s: file too large (%d bytes)",
+                skill_md_path,
+                skill_md_path.stat().st_size,
+            )
+            continue
+        skill_content = skill_md_path.read_bytes().decode(
+            "utf-8", errors="replace"
+        )
         skill_metadata = _parse_skill_metadata(
             content=skill_content,
             skill_path=str(skill_md_path),
@@ -321,7 +339,7 @@ def _extract_version(skill_md: Path) -> int:
     try:
         content = skill_md.read_text(encoding="utf-8", errors="replace")
     except Exception as err:
-        print(err)
+        logger.debug(f"读取技能版本失败: {err}")
         return 0
     match = re.match(r"^---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
     if not match:
@@ -459,9 +477,49 @@ class _SkillToolProvider:
             raw_content = await handle.read(MAX_SKILL_FILE_SIZE)
         return raw_content.decode("utf-8", errors="replace"), truncated
 
-    async def load_skill(self, name: str, explanation: Optional[str] = None) -> str:
+    @staticmethod
+    def _serialize_skill_payload(payload: dict[str, Any]) -> str:
+        """序列化 Skill 返回值，并严格限制最终进入模型的字符数。"""
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        if len(serialized) <= MAX_SKILL_RESULT_CHARS:
+            return serialized
+
+        original_content = str(payload.get("content") or "")
+        truncated_payload = dict(payload)
+        truncated_payload["truncated"] = True
+        low = 0
+        high = len(original_content)
+        best_result = json.dumps(
+            {
+                **truncated_payload,
+                "content": SKILL_CONTENT_TRUNCATION_SUFFIX.strip(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = json.dumps(
+                {
+                    **truncated_payload,
+                    "content": (
+                        original_content[:middle]
+                        + SKILL_CONTENT_TRUNCATION_SUFFIX
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            if len(candidate) <= MAX_SKILL_RESULT_CHARS:
+                best_result = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best_result
+
+    async def load_skill(self, name: str) -> str:
         """加载指定 Skill 的完整说明并返回 JSON 字符串。"""
-        logger.info(f"加载 Skill: name={name}, explanation={explanation or '-'}")
+        logger.info(f"加载 Skill: name={name}")
         try:
             skill = await self._find_skill(name)
             if not skill:
@@ -474,7 +532,7 @@ class _SkillToolProvider:
                 )
 
             content, truncated = await self._read_skill_content(skill["path"])
-            return json.dumps(
+            return self._serialize_skill_payload(
                 {
                     "success": True,
                     "skill": {
@@ -486,9 +544,7 @@ class _SkillToolProvider:
                     },
                     "content": content,
                     "truncated": truncated,
-                },
-                ensure_ascii=False,
-                indent=2,
+                }
             )
         except Exception as err:
             logger.error(f"加载 Skill 失败: {err}", exc_info=True)
@@ -525,6 +581,7 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):  # no
         *,
         sources: list[str],
         bundled_skills_dir: str | None = None,
+        stream_handler: Optional[Any] = None,
     ) -> None:
         """初始化 Skill 中间件。
 
@@ -535,9 +592,12 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):  # no
         bundled_skills_dir : str | None
             项目内置技能目录路径。若提供，在首次加载前会将其中不存在于
             sources 首个目录的技能自动复制过去。
+        stream_handler : Optional[Any]
+            流式输出处理器，用于记录 skill 工具调用摘要。
         """
         self.sources = sources
         self.bundled_skills_dir = bundled_skills_dir
+        self.stream_handler = stream_handler
         self.system_prompt_template = SKILLS_SYSTEM_PROMPT
         self._skill_provider = _SkillToolProvider(sources=sources)
         self.tools = [
@@ -584,7 +644,8 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):  # no
             skills_catalog=_format_skill_tool_catalog(skills)
         )
 
-    def _format_skills_list(self, skills: list[SkillMetadata]) -> str:
+    @staticmethod
+    def _format_skills_list(skills: list[SkillMetadata]) -> str:
         """格式化技能元数据列表用于系统提示词。"""
         if not skills:
             return "(No skills available yet.)"
@@ -621,13 +682,8 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):  # no
     ) -> SkillsStateUpdate | None:  # ty: ignore[invalid-method-override]
         """在 Agent 执行前异步加载技能元数据。
 
-        每个会话仅加载一次。若 state 中已有则跳过。
         首次加载时，会先将内置技能同步到用户目录（如不存在）。
         """
-        # 如果 state 中已存在元数据则跳过
-        if "skills_metadata" in state:
-            return None
-
         self._sync_bundled_skills()
 
         all_skills: dict[str, SkillMetadata] = {}
@@ -656,6 +712,38 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):  # no
         """在模型调用时注入技能文档。"""
         modified_request = self.modify_request(request)
         return await handler(modified_request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[Any]],
+    ) -> Any:
+        """在 skill 工具执行时记录聚合摘要。"""
+        tool = request.tool
+        tool_name = getattr(tool, "name", None)
+        if tool_name != SKILL_TOOL_NAME:
+            return await handler(request)
+
+        tool_call = request.tool_call or {}
+        tool_args = tool_call.get("args") or {}
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+        logger.info(
+            f"开始执行 Skill 工具: name={tool_args.get('name') or '-'}"
+        )
+        if self.stream_handler and getattr(self.stream_handler, "is_streaming", False):
+            self.stream_handler.record_tool_call(
+                tool_name=SKILL_TOOL_NAME,
+                tool_message="Skill loaded",
+                tool_kwargs=tool_args,
+            )
+        try:
+            result = await handler(request)
+        except Exception as err:
+            logger.error(f"Skill 工具执行失败: error={err}")
+            raise
+        logger.info("Skill 工具执行完成")
+        return result
 
 
 __all__ = ["SKILL_TOOL_NAME", "SkillMetadata", "SkillsMiddleware"]
